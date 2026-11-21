@@ -1,0 +1,296 @@
+#version 430 core
+
+layout (local_size_x = 16, local_size_y = 16) in;
+layout (rgba32f, binding = 0) writeonly uniform image2D uOutputImg;
+
+uniform vec3  uCamPos;
+uniform vec3  uCamForward;
+uniform vec3  uCamRight;
+uniform vec3  uCamUp;
+uniform float uTanHalfFov;
+uniform float uAspect;
+
+uniform int   uBhCount;
+uniform vec4  uBlackHoles[2]; // xyz = position, w = Schwarzschild radius (Rs)
+uniform bool  uShowDisc;
+uniform bool  uShowGrid;
+uniform float uTime;
+
+struct RayState {
+    vec3 pos;
+    vec3 vel;
+};
+
+// ============================================================================
+// Procedural Noise for Streaky Accretion Disc Filaments
+// ============================================================================
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float noise2D(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float a = hash12(i);
+    float b = hash12(i + vec2(1.0, 0.0));
+    float c = hash12(i + vec2(0.0, 1.0));
+    float d = hash12(i + vec2(1.0, 1.0));
+
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float fbm(vec2 p) {
+    float val = 0.0;
+    float amp = 0.5;
+    for (int i = 0; i < 4; ++i) {
+        val += amp * noise2D(p);
+        p *= 2.05;
+        amp *= 0.5;
+    }
+    return val;
+}
+
+// ============================================================================
+// Schwarzschild Null Geodesic & RK4 Integrator
+// ============================================================================
+vec3 computeSingleGeodesicAccel(vec3 pos, vec3 vel, vec4 bh) {
+    vec3 relPos = pos - bh.xyz;
+    float r = length(relPos);
+    if (r <= 1e-4) return vec3(0.0);
+
+    vec3 L = cross(relPos, vel);
+    float L2 = dot(L, L);
+    float r5 = r * r * r * r * r;
+
+    return -1.5 * bh.w * (L2 / r5) * relPos;
+}
+
+vec3 computeTotalGeodesicAccel(vec3 pos, vec3 vel) {
+    vec3 total = vec3(0.0);
+    for (int i = 0; i < uBhCount; ++i) {
+        total += computeSingleGeodesicAccel(pos, vel, uBlackHoles[i]);
+    }
+    return total;
+}
+
+RayState rk4Step(RayState state, float dt) {
+    vec3 v1 = state.vel;
+    vec3 a1 = computeTotalGeodesicAccel(state.pos, v1);
+
+    vec3 p2 = state.pos + v1 * (0.5 * dt);
+    vec3 v2 = state.vel + a1 * (0.5 * dt);
+    vec3 a2 = computeTotalGeodesicAccel(p2, v2);
+
+    vec3 p3 = state.pos + v2 * (0.5 * dt);
+    vec3 v3 = state.vel + a2 * (0.5 * dt);
+    vec3 a3 = computeTotalGeodesicAccel(p3, v3);
+
+    vec3 p4 = state.pos + v3 * dt;
+    vec3 v4 = state.vel + a3 * dt;
+    vec3 a4 = computeTotalGeodesicAccel(p4, v4);
+
+    RayState next;
+    next.pos = state.pos + (dt / 6.0) * (v1 + 2.0 * v2 + 2.0 * v3 + v4);
+    next.vel = state.vel + (dt / 6.0) * (a1 + 2.0 * a2 + 2.0 * a3 + a4);
+    return next;
+}
+
+// ============================================================================
+// Starfield, Accretion Disc & Warped Spacetime Grid Sampling
+// ============================================================================
+vec3 sampleStarfield(vec3 dir) {
+    vec3 d = normalize(dir);
+    float band = exp(-abs(d.y * 3.2 + d.x * 0.8));
+    vec3 bg = mix(vec3(0.012, 0.015, 0.028), vec3(0.045, 0.055, 0.095), band);
+
+    vec3 p = floor(d * 260.0);
+    float h = fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+    if (h > 0.9965) {
+        vec3 cellCenter = (p + 0.5) / 260.0;
+        float dist = length(d - normalize(cellCenter)) * 260.0;
+        float starIntensity = smoothstep(0.45, 0.05, dist) * ((h - 0.9965) / 0.0035);
+        vec3 starTint = mix(vec3(0.75, 0.85, 1.0), vec3(1.0, 0.9, 0.72), fract(h * 91.7));
+        bg += starTint * starIntensity * 1.4;
+    }
+    return bg;
+}
+
+vec4 sampleAccretionDisc(vec3 hitPos, vec4 bh) {
+    vec2 relXZ = hitPos.xz - bh.xz;
+    float r = length(relXZ);
+    float innerR = bh.w * 1.55;
+    float outerR = bh.w * 5.8;
+
+    if (r < innerR || r > outerR) return vec4(0.0);
+
+    float t = (r - innerR) / (outerR - innerR); // 0 at inner edge, 1 at outer edge
+
+    // Differential Keplerian shear: twist coordinates by radius so noise stretches into fine arcs
+    float twist = 7.5 / (t + 0.35) - uTime * 1.5;
+    float ca = cos(twist);
+    float sa = sin(twist);
+    vec2 swirled = mat2(ca, -sa, sa, ca) * (relXZ / bh.w);
+
+    float plasma = fbm(swirled * 2.4);
+    float fineRings = noise2D(vec2((r / bh.w) * 16.0, plasma * 3.5));
+    float streaks = mix(plasma, fineRings, 0.5);
+
+    // Relativistic Doppler beaming (gas orbiting counter-clockwise in XZ)
+    vec3 tangentDir = normalize(vec3(-relXZ.y, 0.0, relXZ.x));
+    vec3 toCam = normalize(uCamPos - hitPos);
+    float doppler = dot(tangentDir, toCam); // +1 approaching, -1 receding
+    float beamBoost = clamp(1.0 + 0.38 * doppler, 0.55, 1.45);
+
+    // Color temperature gradient: hot white-blue inner -> bright gold -> deep ember outer
+    vec3 innerHot = mix(vec3(1.0, 0.95, 0.85), vec3(0.85, 0.92, 1.0), clamp(doppler, 0.0, 1.0));
+    vec3 midGold  = vec3(1.0, 0.52, 0.10);
+    vec3 outerRed = vec3(0.45, 0.07, 0.01);
+
+    vec3 baseCol = (t < 0.25)
+        ? mix(innerHot, midGold, t / 0.25)
+        : mix(midGold, outerRed, (t - 0.25) / 0.75);
+
+    // Sharp glowing inner photon boundary + soft wispy outer fade
+    float innerEdge = smoothstep(0.0, 0.05, t);
+    float outerEdge = 1.0 - smoothstep(0.35, 1.0, t);
+    float density = innerEdge * outerEdge * smoothstep(0.22, 0.82, streaks);
+
+    float alpha = clamp(density * 1.15, 0.0, 0.94);
+    return vec4(baseCol * beamBoost * (0.7 + 0.9 * streaks), alpha);
+}
+
+// Flamm's paraboloid height anchored so the throat (r = Rs) sits right at y = 0
+float evalGridHeight(vec2 xz) {
+    float y = 0.0;
+    for (int i = 0; i < uBhCount; ++i) {
+        vec4 bh = uBlackHoles[i];
+        float r = length(xz - bh.xz);
+        float h = 2.0 * sqrt(bh.w * max(r - bh.w, 0.0));
+        y += 0.45 * h - 1.8 * bh.w;
+    }
+    return y;
+}
+
+vec4 sampleSpacetimeGrid(vec3 hitPos, float gridY) {
+    const float halfExtent = 18.0;
+    if (abs(hitPos.x) > halfExtent || abs(hitPos.z) > halfExtent) return vec4(0.0);
+
+    // Cut out inside any black hole's event horizon
+    for (int i = 0; i < uBhCount; ++i) {
+        if (length(hitPos.xz - uBlackHoles[i].xz) < uBlackHoles[i].w) return vec4(0.0);
+    }
+
+    const float cellSize = 0.6;
+    vec2 cellDist = abs(fract(hitPos.xz / cellSize + 0.5) - 0.5) * cellSize;
+    float distToLine = min(cellDist.x, cellDist.y);
+
+    // Crisp anti-aliased line width scaled slightly with camera distance
+    float lineWidth = clamp(length(hitPos - uCamPos) * 0.0014, 0.012, 0.045);
+    float lineMask = 1.0 - smoothstep(lineWidth * 0.5, lineWidth * 1.5, distToLine);
+    if (lineMask <= 0.0) return vec4(0.0);
+
+    // Fade outer edges of the grid smoothly into space
+    vec2 edgeFade2 = 1.0 - smoothstep(halfExtent * 0.72, halfExtent, abs(hitPos.xz));
+    float edgeFade = edgeFade2.x * edgeFade2.y;
+
+    float depthT = clamp(-gridY / 3.5, 0.0, 1.0);
+    vec3 flatCol = vec3(0.24, 0.42, 0.68);
+    vec3 deepCol = vec3(1.00, 0.55, 0.18);
+    vec3 col = mix(flatCol, deepCol, depthT);
+
+    return vec4(col, lineMask * edgeFade * 0.65);
+}
+
+// ============================================================================
+// Main Ray-Marching Entry Point
+// ============================================================================
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uOutputImg);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
+
+    vec3 rayDir = normalize(
+        uCamForward +
+        uv.x * uAspect * uTanHalfFov * uCamRight +
+        uv.y * uTanHalfFov * uCamUp
+    );
+
+    RayState ray;
+    ray.pos = uCamPos;
+    ray.vel = rayDir;
+
+    vec3 accumColor = vec3(0.0);
+    float accumAlpha = 0.0;
+    bool hitHorizon = false;
+
+    const int MAX_STEPS = 420;
+
+    for (int stepIdx = 0; stepIdx < MAX_STEPS; ++stepIdx) {
+        float minDist = 1e6;
+        for (int i = 0; i < uBhCount; ++i) {
+            minDist = min(minDist, length(ray.pos - uBlackHoles[i].xyz));
+        }
+
+        if (minDist > 55.0 && dot(ray.pos, ray.vel) > 0.0) {
+            break;
+        }
+
+        float dt = clamp(0.055 * minDist, 0.015, 0.8);
+        vec3 prevPos = ray.pos;
+        ray = rk4Step(ray, dt);
+
+        // 1. Check spacetime grid surface intersection (so grid is lensed & occluded by BH)
+        if (uShowGrid && accumAlpha < 0.98) {
+            float gPrev = prevPos.y - evalGridHeight(prevPos.xz);
+            float gCurr = ray.pos.y - evalGridHeight(ray.pos.xz);
+            if ((gPrev <= 0.0 && gCurr >= 0.0) || (gPrev >= 0.0 && gCurr <= 0.0)) {
+                float denom = abs(gPrev) + abs(gCurr);
+                float hitT = (denom > 1e-6) ? abs(gPrev) / denom : 0.5;
+                vec3 hitPos = mix(prevPos, ray.pos, hitT);
+
+                vec4 gridSample = sampleSpacetimeGrid(hitPos, hitPos.y);
+                if (gridSample.a > 0.0) {
+                    accumColor += (1.0 - accumAlpha) * gridSample.rgb * gridSample.a;
+                    accumAlpha += (1.0 - accumAlpha) * gridSample.a;
+                }
+            }
+        }
+
+        // 2. Check event horizon & accretion disc intersections
+        for (int i = 0; i < uBhCount; ++i) {
+            vec4 bh = uBlackHoles[i];
+
+            if (length(ray.pos - bh.xyz) <= bh.w) {
+                hitHorizon = true;
+                break;
+            }
+
+            if (uShowDisc && accumAlpha < 0.98) {
+                float dyPrev = prevPos.y - bh.y;
+                float dyCurr = ray.pos.y - bh.y;
+                if ((dyPrev <= 0.0 && dyCurr >= 0.0) || (dyPrev >= 0.0 && dyCurr <= 0.0)) {
+                    float denom = abs(dyPrev) + abs(dyCurr);
+                    float hitT = (denom > 1e-6) ? abs(dyPrev) / denom : 0.5;
+                    vec3 hitPos = mix(prevPos, ray.pos, hitT);
+
+                    vec4 discSample = sampleAccretionDisc(hitPos, bh);
+
+                    if (discSample.a > 0.0) {
+                        accumColor += (1.0 - accumAlpha) * discSample.rgb * discSample.a;
+                        accumAlpha += (1.0 - accumAlpha) * discSample.a;
+                     }
+                }
+            }
+        }
+    if (hitHorizon || accumAlpha >= 0.98) break;
+}
+vec3 bgColor = hitHorizon ? vec3(0.0) : sampleStarfield(ray.vel);
+vec3 finalColor = accumColor + (1.0 - accumAlpha) * bgColor;
+imageStore(uOutputImg, pixel, vec4(finalColor, 1.0));
+}
